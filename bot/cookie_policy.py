@@ -27,10 +27,14 @@ Three jobs:
 """
 
 import hashlib
+import os
 import re
+import shutil
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from .storage import read_json, write_json_atomic
@@ -67,6 +71,43 @@ def needs_cookies(url: str) -> bool:
     return any(re.search(pattern, path, re.IGNORECASE) for pattern in _LOGIN_WALLED_PATTERNS)
 
 
+@contextmanager
+def private_cookies(cookies_file: Path | None, tag: str) -> Iterator[Path | None]:
+    """
+    Hands out a throwaway copy of the cookie file for one yt-dlp run.
+
+    yt-dlp writes the jar back when it closes, and it does that by opening
+    the file in "w" — truncate first, write after. Three download workers and
+    the link preview all pointed at the SAME data/cookies.txt, so one job
+    truncating while another read meant an empty or half-written session out
+    of nowhere: every platform "logged out" at once, for no reason anybody
+    could see in the logs.
+
+    Working from a copy means nothing writes the shared file any more. The
+    cost is that cookies refreshed during a download are dropped; the file is
+    maintained by the admin anyway, and a stale cookie is a far smaller
+    problem than a shredded one.
+    """
+    if not cookies_file:
+        yield None
+        return
+
+    source = Path(cookies_file)
+    if not source.exists():
+        yield None
+        return
+
+    handle, temp_name = tempfile.mkstemp(prefix=f"cookies-{tag}-", suffix=".txt")
+    os.close(handle)
+    copy = Path(temp_name)
+    try:
+        shutil.copy2(source, copy)
+        os.chmod(copy, 0o600)
+        yield copy
+    finally:
+        copy.unlink(missing_ok=True)
+
+
 class CookiePreference:
     """
     Remembers which request style actually worked per platform.
@@ -79,6 +120,12 @@ class CookiePreference:
 
     TTL = 12 * 3600
 
+    # A platform that refuses anonymous requests is refusing this server's
+    # IP, and that verdict outlives a single day. Re-testing it every 12
+    # hours costs a wasted request and, worse, another bot-check strike
+    # against the address, so a block is remembered for a week.
+    BLOCK_TTL = 7 * 24 * 3600
+
     def __init__(self, data_dir: Path):
         self.file = Path(data_dir) / "cookie_pref.json"
 
@@ -88,19 +135,44 @@ class CookiePreference:
             return {"platforms": {}}
         return data
 
-    def record_success(self, platform: str, used_cookies: bool) -> None:
+    def _entry(self, platform: str) -> dict[str, Any]:
+        entry = self._load()["platforms"].get(platform)
+        return entry if isinstance(entry, dict) else {}
+
+    def _write(self, platform: str, changes: dict[str, Any]) -> None:
         if not platform:
             return
         try:
             data = self._load()
-            data["platforms"][platform] = {"cookies": bool(used_cookies), "at": time.time()}
+            entry = data["platforms"].get(platform)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry.update(changes)
+            data["platforms"][platform] = entry
             write_json_atomic(self.file, data)
         except Exception:
             pass
 
+    def record_success(self, platform: str, used_cookies: bool) -> None:
+        changes: dict[str, Any] = {"cookies": bool(used_cookies), "at": time.time()}
+        # Getting a file anonymously is proof the block is gone.
+        if not used_cookies:
+            changes["anon_blocked_at"] = 0
+        self._write(platform, changes)
+
+    def record_anonymous_block(self, platform: str) -> None:
+        """The platform answered a logged-out request with a bot check."""
+        self._write(platform, {"anon_blocked_at": time.time()})
+
+    def anonymous_blocked(self, platform: str) -> bool:
+        entry = self._entry(platform)
+        blocked_at = float(entry.get("anon_blocked_at") or 0)
+        return bool(blocked_at) and time.time() - blocked_at <= self.BLOCK_TTL
+
     def preferred(self, platform: str) -> bool | None:
-        entry = self._load()["platforms"].get(platform)
-        if not isinstance(entry, dict):
+        if self.anonymous_blocked(platform):
+            return True
+        entry = self._entry(platform)
+        if not entry or "cookies" not in entry:
             return None
         if time.time() - float(entry.get("at", 0)) > self.TTL:
             return None
@@ -240,6 +312,28 @@ def impersonate_target(url: str) -> Any | None:
 
     target = ImpersonateTarget("chrome")
     return target if _impersonation_available(target) else None
+
+
+def extractor_args(url: str) -> dict[str, Any]:
+    """
+    Extractor-specific arguments for this URL. Empty when none apply.
+
+    YouTube's normal clients now hand out their https (DASH) streams only
+    against a GVS PO token; without one they are dropped and all that is
+    left is HLS. That is the expensive route: no audio-only stream exists
+    there at all, so an audio job downloaded a 9.6 MB muxed video to keep a
+    3 MB song, and every file arrived in 26 fragments — the shape that also
+    trips yt-dlp's parallel-fragment bug.
+
+    The embedded player still answers without a token (33 formats against
+    11, audio-only among them). It is ADDED to the default clients rather
+    than replacing them, so a video that cannot be embedded still gets an
+    answer from the usual ones; the extra client costs about half a second.
+    """
+    host = (urlparse(url).netloc or "").lower()
+    if "youtube.com" in host or host.endswith("youtu.be"):
+        return {"youtube": {"player_client": ["web_embedded", "default"]}}
+    return {}
 
 
 def pacing(url: str) -> dict[str, Any]:

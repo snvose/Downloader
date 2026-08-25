@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .storage import read_json, write_json_atomic
+from .cookie_policy import private_cookies
 
 
 # ── 1. Detection ─────────────────────────────────────────────────────────────
@@ -92,12 +93,13 @@ def probe_is_live(
         "extract_flat": "in_playlist",
     }
 
-    if cookies_file and Path(cookies_file).exists():
-        opts["cookiefile"] = str(cookies_file)
-
+    # A copy, never the shared file: yt-dlp rewrites the jar it is handed.
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
+        with private_cookies(cookies_file, "live") as jar:
+            if jar is not None:
+                opts["cookiefile"] = str(jar)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False, process=False)
     except Exception:
         return False, {}
 

@@ -73,6 +73,11 @@ account flagged. When a platform answers with a rate limit or a bot check,
 requests there stay anonymous for a while instead of walking the session
 into the wall.
 
+The cookie file itself is never handed to a downloader directly — every run
+works from its own copy. yt-dlp and gallery-dl both rewrite the jar when they
+exit, and with several downloads in flight that meant one worker truncating
+the file while another was reading it.
+
 The session itself is checked every hour, and the admin gets one detailed
 report on the days something needs refreshing: which platform, since when,
 how many downloads it cost, and which cookie to re-export.

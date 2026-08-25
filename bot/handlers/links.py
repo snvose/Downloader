@@ -21,8 +21,14 @@ from telegram.ext import ContextTypes
 from bot.safe_message import safe_message_edit, safe_reply
 from bot.emoji_manager import em
 from bot.i18n import t
-from bot.cookie_policy import browser_headers, cookie_order, impersonate_target
-from bot.live_guard import format_duration, guard_message, info_is_live, probe_is_live
+from bot.cookie_policy import (
+    browser_headers,
+    cookie_order,
+    extractor_args,
+    impersonate_target,
+    private_cookies,
+)
+from bot.live_guard import format_duration, guard_message, info_is_live
 from bot.pending import clear_user_pending
 from bot.ui import analyzing_text, unsupported_spotify_text
 from bot.utils import (
@@ -103,6 +109,12 @@ def _sync_extract_info(url: str, cookies_file: Path | None = None) -> dict:
         "http_headers": browser_headers(url),
     }
 
+    # The same extractor arguments the download uses, so the preview reads
+    # the formats that will actually be fetched.
+    extra = extractor_args(url)
+    if extra:
+        base_opts["extractor_args"] = extra
+
     # Public content is asked for anonymously first; the session is the
     # fallback. Besides being the safer request to make, it is the faster
     # one — a cookie-authenticated metadata query measured roughly twice as
@@ -114,22 +126,25 @@ def _sync_extract_info(url: str, cookies_file: Path | None = None) -> dict:
     # extractor dislikes the copied browser response still gets an answer.
     plan = [(flag, True) for flag in order] + [(order[0], False)]
 
-    for use_cookies, impersonate in plan:
-        opts = dict(base_opts)
-        if use_cookies and cookies_file and cookies_file.exists():
-            opts["cookiefile"] = str(cookies_file)
-        target = impersonate_target(url) if impersonate else None
-        if target is not None:
-            opts["impersonate"] = target
+    # A copy of the cookie file, never the shared one — yt-dlp rewrites the
+    # jar it is given, and previews run while downloads are in flight.
+    with private_cookies(cookies_file, "info") as jar:
+        for use_cookies, impersonate in plan:
+            opts = dict(base_opts)
+            if use_cookies and jar is not None:
+                opts["cookiefile"] = str(jar)
+            target = impersonate_target(url) if impersonate else None
+            if target is not None:
+                opts["impersonate"] = target
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False, process=True)
-            if info is None:
-                raise RuntimeError("Could not fetch content info.")
-            return _compact_metadata(info, url)
-        except Exception as exc:
-            last_exc = exc
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False, process=True)
+                if info is None:
+                    raise RuntimeError("Could not fetch content info.")
+                return _compact_metadata(info, url)
+            except Exception as exc:
+                last_exc = exc
 
     raise last_exc or RuntimeError("Could not fetch content info.")
 
@@ -148,20 +163,21 @@ def _sync_extract_playlist(url: str, cookies_file: Path | None = None) -> dict:
     }
 
     last_exc: Exception | None = None
-    for use_cookies in cookie_order(
-        url, data_dir=cookies_file.parent if cookies_file else None,
-    ):
-        opts = dict(base_opts)
-        if use_cookies and cookies_file and cookies_file.exists():
-            opts["cookiefile"] = str(cookies_file)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False, process=False)
-            if info is None:
-                raise RuntimeError("Could not fetch playlist info.")
-            return info  # type: ignore[return-value]
-        except Exception as exc:
-            last_exc = exc
+    with private_cookies(cookies_file, "playlist") as jar:
+        for use_cookies in cookie_order(
+            url, data_dir=cookies_file.parent if cookies_file else None,
+        ):
+            opts = dict(base_opts)
+            if use_cookies and jar is not None:
+                opts["cookiefile"] = str(jar)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False, process=False)
+                if info is None:
+                    raise RuntimeError("Could not fetch playlist info.")
+                return info  # type: ignore[return-value]
+            except Exception as exc:
+                last_exc = exc
 
     raise last_exc or RuntimeError("Could not fetch playlist info.")
 
@@ -923,28 +939,12 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # ── 2 & 3. YouTube / YouTube Music ────────────────────────────────────
         if _is_youtube_url(url):
-            # A quick livestream check (extract_flat, ~1.5s) runs before the
-            # full metadata fetch. Sequential is faster overall than parallel
-            # here: YouTube throttles two concurrent requests, and a live hit
-            # skips the expensive metadata fetch entirely.
-            # Cookies are deliberately NOT used for this probe: live status is
-            # public and a cookie-authenticated query measured 2x slower
-            # (3.6s vs 1.5s). A failed probe (age-restricted/private) returns
-            # False and the normal flow continues; the worker's cookie-backed
-            # check catches it later.
-            try:
-                probe_live, _probe_info = await loop.run_in_executor(
-                    None, probe_is_live, url
-                )
-            except Exception:
-                probe_live = False
-
-            if probe_live:
-                await _reject_live(
-                    context, user=user, wait_msg=wait_msg, is_admin=is_admin
-                )
-                return
-
+            # There used to be a separate livestream probe here, ahead of the
+            # metadata fetch, to skip that fetch on a live link. It cost ~1.9s
+            # on EVERY YouTube link to save time on the rare live one, and the
+            # fetch below reports is_live anyway (checked right after). The
+            # worker runs its own check before downloading, so a link whose
+            # metadata fetch fails outright is still caught.
             try:
                 info = await loop.run_in_executor(
                     None, _sync_extract_info, url, config.cookies_file
