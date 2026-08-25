@@ -521,6 +521,15 @@ _STRINGS: dict[str, dict[str, str]] = {
         "es": "Este enlace no es compatible.", "fr": "Ce lien n'est pas pris en charge.",
         "ar": "هذا الرابط غير مدعوم.",
     },
+    "err_geo_blocked": {
+        "tr": "Bu gönderi sunucunun bulunduğu bölgeye kapalı. Cookie değiştirmek bunu çözmez.",
+        "en": "This post is closed to the server's region. Different cookies won't change that.",
+        "ru": "Эта публикация недоступна из региона сервера. Смена cookie не поможет.",
+        "de": "Dieser Beitrag ist für die Region des Servers gesperrt. Andere Cookies ändern das nicht.",
+        "es": "Esta publicación está bloqueada para la región del servidor. Otras cookies no lo cambian.",
+        "fr": "Ce post est bloqué pour la région du serveur. D'autres cookies n'y changeront rien.",
+        "ar": "هذا المنشور محجوب عن منطقة الخادم. تغيير الكوكيز لن يغيّر ذلك.",
+    },
     "err_restricted": {
         "tr": "Bu gönderi yalnızca belirli kişilere açık (yaş / kitle sınırı). Bot erişemiyor.",
         "en": "This post is limited to certain viewers (age or audience restriction).",

@@ -273,6 +273,10 @@ def safe_public_error(raw: str) -> str:
         or "comfortable for some audiences" in lowered
     ):
         return t("err_restricted")
+    # An IP block is about where the server sits, not about the session, so
+    # it must not be reported as a login or a cookie problem.
+    if "ip address is blocked" in lowered or "not available in your country" in lowered:
+        return t("err_geo_blocked")
     if "tiktok" in lowered and ("403" in lowered or "forbidden" in lowered):
         return t("err_tiktok_403")
     # A text-only post: checked before the access rules, which would otherwise

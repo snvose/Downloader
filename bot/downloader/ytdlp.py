@@ -25,10 +25,12 @@ from bot.cookie_policy import (
     CookiePreference,
     browser_headers,
     cookie_order,
+    extractor_args,
     impersonate_target,
     is_bot_check_error,
     needs_cookies,
     pacing,
+    private_cookies,
 )
 from bot.utils import instagram_story_kind, platform_name
 
@@ -149,19 +151,21 @@ def _download_with_gallery_dl(
     cmd += ["--sleep-request", "1"]
 
     # The session is only handed over when the link actually needs it, or
-    # when the anonymous path has already failed here.
-    if cookies_file and cookies_file.exists() and use_cookies:
-        cmd += ["--cookies", str(cookies_file)]
+    # when the anonymous path has already failed here. gallery-dl writes the
+    # jar back on exit as well, so it gets a copy too.
+    with private_cookies(cookies_file if use_cookies else None, job_id) as jar:
+        if jar is not None:
+            cmd += ["--cookies", str(jar)]
 
-    cmd.append(url)
+        cmd.append(url)
 
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=120,
-    )
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
 
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
@@ -1160,12 +1164,50 @@ _TERMINAL_MARKERS = (
     "account has been terminated",
     "unsupported url",
     "is not a valid url",
+    # Aimed at the server's address: the session cannot move it, so the
+    # remaining attempts would collect the same answer four more times.
+    "ip address is blocked",
 )
 
 
 def _is_terminal_error(error: Exception) -> bool:
     msg = str(error).lower()
     return any(marker in msg for marker in _TERMINAL_MARKERS)
+
+
+def _is_fragment_race_error(error: Exception) -> bool:
+    """
+    Did a fragmented download fall over its own parallelism?
+
+    yt-dlp writes each fragment to its own ".part-FragN" file. When one
+    fragment comes back empty ("Did not get any data blocks" — YouTube's HLS
+    does this regularly) the parallel writer can still go looking for that
+    file, and the whole download dies on a missing path. Downloading the
+    fragments one at a time takes the same route without the race.
+    """
+    msg = str(error).lower()
+    return ".part-frag" in msg or ("no such file or directory" in msg and "frag" in msg)
+
+
+_ACCESS_REFUSAL_MARKERS = (
+    "http error 403",
+    "403: forbidden",
+    "sign in to confirm",
+    "login required",
+    "requires authentication",
+)
+
+
+def _is_access_refusal(error: Exception) -> bool:
+    """
+    Was the request turned away at the door, rather than answered with a
+    reason about this particular post?
+
+    Only this kind of refusal says anything about how the platform treats
+    logged-out requests in general.
+    """
+    msg = str(error).lower()
+    return any(marker in msg for marker in _ACCESS_REFUSAL_MARKERS)
 
 
 def _should_retry_without_cookies(error: Exception) -> bool:
@@ -1344,6 +1386,10 @@ def _build_opts(
 
     opts.update(pacing(url))
 
+    extra = extractor_args(url)
+    if extra:
+        opts["extractor_args"] = extra
+
     if shutil.which("ffmpeg"):
         opts["ffmpeg_location"] = shutil.which("ffmpeg")
 
@@ -1365,7 +1411,13 @@ def _build_opts(
         # For FLAC, getting the source's best audio stream matters too: a
         # lossless container around a low-bitrate stream only inflates the
         # file, not the quality.
-        opts["format"] = "bestaudio/best"
+        # bestaudio is the normal route; the height cap only applies when a
+        # source has no audio-only stream at all. That happens on YouTube
+        # whenever the embedded player cannot answer (see extractor_args):
+        # what is left are muxed streams carrying the SAME 128 kbps AAC
+        # track at every resolution, so plain "best" fetched 9.6 MB of video
+        # to keep 3 MB of audio where the cap fetches 3.9 MB.
+        opts["format"] = "bestaudio/best[height<=480]/best"
         if codec == "flac":
             opts["format_sort"] = ["abr", "asr"]
 
@@ -1431,7 +1483,14 @@ def _build_opts(
     #     because YouTube only has h264 up to 1080p; an unbounded "res" picks
     #     2160p vp9, which is both unplayable and forces a 4K transcode below.
     #   vcodec/acodec — h264+aac wins at the same resolution when available.
-    opts["format_sort"] = ["res:1080", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"]
+    #   proto:https — at the same resolution and codec, a plain stream beats
+    #     a fragmented one. On YouTube the HLS variant carries exactly the
+    #     same video (84.4 MB either way) but arrives in dozens of fragment
+    #     requests, which is both slower and the case yt-dlp's parallel
+    #     fragment writer gets wrong.
+    opts["format_sort"] = [
+        "res:1080", "vcodec:h264", "proto:https", "acodec:aac", "ext:mp4:m4a",
+    ]
 
     opts["merge_output_format"] = "mp4"
 
@@ -1466,6 +1525,36 @@ def _try_ytdlp_once(
     subtitle_lang: str = "",
     impersonate: bool = True,
 ) -> tuple[list[str], str, dict[str, Any]]:
+    # yt-dlp rewrites whatever cookie file it is given, so it gets a copy
+    # (see private_cookies) — never the one the other workers are reading.
+    with private_cookies(cookies_file if use_cookies else None, job_id) as jar:
+        return _run_ytdlp_attempt(
+            job_id=job_id,
+            url=url,
+            download_dir=download_dir,
+            queue=queue,
+            cookies_file=jar,
+            mode=mode,
+            use_cookies=use_cookies and jar is not None,
+            format_profile=format_profile,
+            subtitle_lang=subtitle_lang,
+            impersonate=impersonate,
+        )
+
+
+def _run_ytdlp_attempt(
+    *,
+    job_id: str,
+    url: str,
+    download_dir: Path,
+    queue: Any,
+    cookies_file: Path | None,
+    mode: str,
+    use_cookies: bool,
+    format_profile: str,
+    subtitle_lang: str = "",
+    impersonate: bool = True,
+) -> tuple[list[str], str, dict[str, Any]]:
     opts = _build_opts(
         job_id=job_id,
         url=url,
@@ -1482,14 +1571,35 @@ def _try_ytdlp_once(
     title = ""
     compact_info: dict[str, Any] = {"platform": platform_name(url), "webpage_url": url}
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if isinstance(info, dict):
-            # Catches content that went live between the query and the download.
-            if info_is_live(info):
-                raise LiveStreamError("Livestreams cannot be downloaded.")
-            title = str(info.get("title") or "")
-            compact_info = _compact_info(info, url)
+    def _run(run_opts: dict[str, Any]) -> Any:
+        with yt_dlp.YoutubeDL(run_opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    try:
+        info = _run(opts)
+    except LiveStreamError:
+        raise
+    except Exception as exc:
+        if not _is_fragment_race_error(exc):
+            raise
+        # Same request, one fragment at a time. Measured on a YouTube Music
+        # track that fails this way most runs: 16 parallel fragments failed
+        # 4 times out of 6, serial fetching 0 out of 3, and cost ~2 seconds.
+        queue.put(log_event(
+            job_id, "warning",
+            "Parallel fragments broke apart — downloading them one at a time.",
+        ))
+        _clear_partial_files(download_dir)
+        serial_opts = dict(opts)
+        serial_opts["concurrent_fragment_downloads"] = 1
+        info = _run(serial_opts)
+
+    if isinstance(info, dict):
+        # Catches content that went live between the query and the download.
+        if info_is_live(info):
+            raise LiveStreamError("Livestreams cannot be downloaded.")
+        title = str(info.get("title") or "")
+        compact_info = _compact_info(info, url)
 
     files = collect_files(download_dir, mode=mode)
     if not files:
@@ -1636,7 +1746,14 @@ def download_with_ytdlp(
     platform = platform_name(url)
     order = cookie_order(url, data_dir=data_dir)
 
-    if cooldown.active(platform) and not needs_cookies(url):
+    # An anonymous request that the platform already refuses is not a
+    # fallback, so the cooldown reshuffle is skipped in that case: there
+    # would be nothing left to fall back to.
+    if (
+        cooldown.active(platform)
+        and not needs_cookies(url)
+        and not preference.anonymous_blocked(platform)
+    ):
         queue.put(log_event(
             job_id, "info",
             f"{platform} recently rate-limited the session — staying logged out for now.",
@@ -1708,6 +1825,14 @@ def download_with_ytdlp(
             if filtered:
                 attempts = filtered
 
+    # Whether the platform refused the LOGGED-OUT request in a way that is
+    # about access in general (a bot check, a 403) rather than about this one
+    # post. Only that kind of refusal is worth learning from: a session that
+    # got past an age gate proves nothing about the next public link, and
+    # recording it would send the cookies on every request afterwards — the
+    # exact habit that gets an account flagged.
+    anonymous_refused = False
+
     for index, (label, use_cookies, format_profile, impersonate) in enumerate(attempts):
         try:
             queue.put(log_event(job_id, "info", f"yt-dlp attempt: {label}"))
@@ -1723,7 +1848,8 @@ def download_with_ytdlp(
                 subtitle_lang=subtitle_lang,
                 impersonate=impersonate,
             )
-            preference.record_success(platform, use_cookies)
+            if not needs_cookies(url) and (not use_cookies or anonymous_refused):
+                preference.record_success(platform, use_cookies)
             return result
 
         except LiveStreamError:
@@ -1736,16 +1862,32 @@ def download_with_ytdlp(
             errors.append(f"{label}: {message}")
             queue.put(log_event(job_id, "warning", f"yt-dlp failed [{label}]: {message}"))
 
-            # A rate limit or a bot check is aimed at the account, not at
-            # this one request. Note it so the next jobs on this platform
-            # stay anonymous instead of walking the session into the wall.
+            if not use_cookies and (
+                is_bot_check_error(message) or _is_access_refusal(exc)
+            ):
+                anonymous_refused = True
+
+            # A rate limit or a bot check is aimed at the account or the
+            # address, not at this one request — but which one depends on
+            # who was asking. Pushing back on the SESSION means the cookies
+            # need a rest; pushing back on a LOGGED-OUT request says nothing
+            # about the session, and putting the cookies in cooldown for it
+            # (as this used to) forced every following job down the exact
+            # path that had just been refused.
             if is_bot_check_error(message):
-                cooldown.mark(platform, message)
                 if use_cookies:
+                    cooldown.mark(platform, message)
                     queue.put(log_event(
                         job_id, "warning",
                         f"{platform} pushed back on the session — "
                         f"cookie-based attempts paused for a while.",
+                    ))
+                else:
+                    preference.record_anonymous_block(platform)
+                    queue.put(log_event(
+                        job_id, "info",
+                        f"{platform} refuses logged-out requests from this server — "
+                        f"the session goes first from now on.",
                     ))
 
             # An audience gate answers the ACCOUNT, so once the session has
